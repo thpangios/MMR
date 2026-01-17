@@ -1,0 +1,35 @@
+{
+  "manheimCookies": [
+    {
+      "name": "SESSION",
+      "value": "NDA5ZGFmMTUtNTM2OC00OTMyLWE3NjktYjBiZjMxMjU0MDFi",
+      "domain": ".manheim.com",
+      "path": "/",
+      "httpOnly": true,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "session",
+      "value": "eyJhc3NvY2lhdGVkVG9rZW5zIjpbIm5jcGdnbnV1aG1qZzd2Y2FmaDd1YnRxdyJdLCJ1c2VyU3VtbWFyeSI6eyJhY2NvdW50TmFtZSI6IkFMTCBTVEFSIEVYUE9SVCBMVEQiLCJhY2NvdW50TnVtYmVyIjoiNTUzMDg1MyIsImV4dGVybmFsQWNjZXNzVG9rZW4iOiJuY3BnZ251dWhtamc3dmNhZmg3dWJ0cXciLCJmaXJzdE5hbWUiOiJPTUFSIiwibGFzdE5hbWUiOiJBTCBPTUFSIiwicmVwTnVtYmVyIjoiMTAxMjYyNTE5IiwidG90YWxJc3N1ZXMiOjAsInVzZXJuYW1lIjoib21hcmFsb21hciJ9fQ==",
+      "domain": "mcom-header-footer.manheim.com",
+      "path": "/",
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "None"
+    },
+    {
+      "name": "session.sig",
+      "value": "BPzqO3V4fHW_zRIo6OqqWrJyIms",
+      "domain": "mcom-header-footer.manheim.com",
+      "path": "/",
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "None"
+    }
+  ],
+  "supabaseEdgeFunctionUrl": "https://nyhpgaksdlmrclraqqmg.supabase.co/functions/v1/get-next-vin",
+  "n8nWebhookUrl": "https://n8n-production-0d7d.up.railway.app/webhook/MMR",
+  "maxVINsPerRun": 1,
+  "delayBetweenVINs": [2000, 3000]
+}
