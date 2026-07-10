@@ -525,18 +525,50 @@ await Actor.main(async () => {
         console.log(`${'='.repeat(60)}\n`);
 
         while (vinsProcessed < maxVINsPerRun) {
-            try {
-                // Get next VIN from Supabase
-                console.log(`\n📞 STEP 3.${vinsProcessed + 1}: Fetching VIN from Supabase...`);
+            // --- Fetch next VIN (resilient) -----------------------------------------
+            // The Supabase edge function occasionally returns an HTML error page
+            // (gateway/cold-start/5xx) instead of JSON. Retry a few times, then end the
+            // run cleanly rather than crashing — the next scheduled run picks up where we left off.
+            let vinData = null;
+            let vinFetchFailed = false;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                console.log(`\n📞 STEP 3.${vinsProcessed + 1}: Fetching VIN from Supabase...${attempt > 1 ? ` (retry ${attempt}/3)` : ''}`);
                 console.log(`  → URL: ${supabaseEdgeFunctionUrl}`);
-                const vinResponse = await fetch(supabaseEdgeFunctionUrl);
-                const vinData = await vinResponse.json();
-
-                if (!vinData.success || !vinData.data) {
-                    console.log('  ✅ No more pending VINs. Scraping complete!');
-                    break;
+                try {
+                    const vinResponse = await fetch(supabaseEdgeFunctionUrl);
+                    const rawBody = await vinResponse.text();
+                    if (!vinResponse.ok) {
+                        throw new Error(`HTTP ${vinResponse.status}: ${rawBody.slice(0, 150).replace(/\s+/g, ' ').trim()}`);
+                    }
+                    try {
+                        vinData = JSON.parse(rawBody);
+                    } catch {
+                        throw new Error(`Non-JSON response (transient gateway/HTML error): ${rawBody.slice(0, 150).replace(/\s+/g, ' ').trim()}`);
+                    }
+                    break; // got valid JSON
+                } catch (fetchErr) {
+                    console.log(`  ⚠️ VIN fetch failed: ${fetchErr.message}`);
+                    if (attempt < 3) {
+                        const backoffMs = attempt * 4000;
+                        console.log(`  ⏳ Retrying in ${(backoffMs / 1000).toFixed(0)}s...`);
+                        await humanDelay(backoffMs, backoffMs + 1000);
+                    } else {
+                        vinFetchFailed = true;
+                    }
                 }
+            }
 
+            if (vinFetchFailed) {
+                console.log('  ⚠️ Could not fetch a VIN after 3 attempts (Supabase likely returning errors). Ending run cleanly — the next scheduled run will retry.');
+                break;
+            }
+
+            if (!vinData.success || !vinData.data) {
+                console.log('  ✅ No more pending VINs. Scraping complete!');
+                break;
+            }
+
+            try {
                 const {
                     id: listing_id,
                     vin,
@@ -968,7 +1000,9 @@ await Actor.main(async () => {
             } catch (vinError) {
                 console.error(`❌ Error processing VIN:`, vinError.message);
                 // Capture exactly what the page looked like at the moment of failure.
-                await saveDiagnostics(mmrPage, `vin-error-${vin || 'unknown'}`);
+                // NOTE: use vinData?.data?.vin (loop scope) — `vin` is block-scoped to the try
+                // and would itself throw "vin is not defined" if the error hit before it was set.
+                await saveDiagnostics(mmrPage, `vin-error-${vinData?.data?.vin || 'unknown'}`);
                 vinsFailed++;
                 vinsProcessed++;
 
