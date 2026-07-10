@@ -413,90 +413,48 @@ await Actor.main(async () => {
 
         let mmrPage = null;
 
-        // Try clicking button first (human-like behavior)
+        // IMPORTANT (changed 2026-07-10): Open the MMR tool by DIRECT NAVIGATION, not the
+        // header button. Manheim changed their auth so the button's popup OAuth flow
+        // (auth.manheim.com/as/authorization.oauth2) no longer performs silent SSO — it now
+        // drops to a "Sign In" page even with valid, fresh session cookies. Loading the MMR
+        // URL directly still authenticates via the session cookies and returns live MMR data
+        // (verified end-to-end: getValuation VIN call → HTTP 200). The old button/popup path
+        // is kept below (disabled) for reference only.
+        console.log('  → Opening MMR tool via DIRECT navigation (popup OAuth flow no longer authenticates)...');
+        mmrPage = await context.newPage();
+        await mmrPage.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+        });
+        console.log('  ✅ MMR tool opened via direct navigation');
+
+        /* ---- DISABLED: legacy header-button + popup OAuth flow (broke 2026-07-10) ----
         try {
-            console.log('  → Checking for iframes...');
             const frames = page.frames();
-            console.log(`  → Found ${frames.length} frames`);
-
-            // Look for header iframe
-            let headerFrame = null;
-            for (const frame of frames) {
-                const url = frame.url();
-                console.log(`  → Frame URL: ${url}`);
-                if (url.includes('mcom-header-footer')) {
-                    headerFrame = frame;
-                    console.log('  ✅ Found header/footer iframe!');
-                    break;
-                }
-            }
-
-            // Decide where to click based on iframe detection
-            let clickTarget;
-            if (headerFrame) {
-                console.log('  → Attempting to click MMR button inside iframe...');
-                clickTarget = headerFrame.locator('[data-test-id="mmr-btn"]').first();
-            } else {
-                console.log('  → Attempting to click MMR button on main page...');
-                clickTarget = page.locator('[data-test-id="mmr-btn"]').first();
-            }
-
-            // Wait for button to be visible
+            let headerFrame = frames.find(f => f.url().includes('mcom-header-footer'));
+            const clickTarget = headerFrame
+                ? headerFrame.locator('[data-test-id="mmr-btn"]').first()
+                : page.locator('[data-test-id="mmr-btn"]').first();
             await clickTarget.waitFor({ state: 'visible', timeout: 10000 });
-            console.log('  ✅ MMR button is visible');
-
-            // Set up BOTH popup AND navigation listeners (race condition)
             const popupPromise = context.waitForEvent('page', {
                 predicate: (p) => p.url().includes('mmr.manheim.com'),
                 timeout: 10000
             }).catch(() => null);
-
-            const navigationPromise = page.waitForNavigation({
-                url: /mmr\.manheim\.com/,
-                waitUntil: 'domcontentloaded',
-                timeout: 10000
-            }).catch(() => null);
-
-            // Click button with hover first (more human-like)
             await clickTarget.hover();
-            await humanDelay(300, 600);
             await clickTarget.click({ timeout: 10000 });
-            console.log('  ✅ MMR button clicked');
-
-            // Wait for EITHER popup OR same-tab navigation
-            console.log('  → Waiting for MMR tool to open (popup or navigation)...');
-            const result = await Promise.race([popupPromise, navigationPromise]);
-
-            // Check if we got a new popup page (has url() method) or same-tab navigation
-            if (result && typeof result.url === 'function') {
-                // New popup opened
-                mmrPage = result;
-                console.log(`  ✅ Popup opened successfully: ${mmrPage.url()}`);
-            } else {
-                // Same-tab navigation occurred (or both timed out, but page might have navigated)
-                mmrPage = page;
-                console.log(`  ✅ Navigated in same tab: ${mmrPage.url()}`);
-            }
-
+            mmrPage = await popupPromise;
         } catch (error) {
-            console.log(`  ⚠️ Button/popup approach failed: ${error.message}`);
-            console.log('  → Fallback: Opening MMR tool directly...');
-
-            // Fallback: Navigate directly to MMR tool
             mmrPage = await context.newPage();
-            await mmrPage.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man', {
-                waitUntil: 'domcontentloaded',
-                timeout: 30000
-            });
-            console.log('  ✅ MMR tool loaded via direct navigation');
+            await mmrPage.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man',
+                { waitUntil: 'domcontentloaded', timeout: 30000 });
         }
+        ------------------------------------------------------------------------------- */
 
         // Verify we have MMR page
         if (!mmrPage) {
             console.error('\n❌ Failed to open MMR tool!');
-            const screenshot = await page.screenshot({ fullPage: false });
-            await Actor.setValue('mmr-failed-screenshot', screenshot, { contentType: 'image/png' });
-            throw new Error('Could not access MMR tool - both button click and direct navigation failed');
+            await saveDiagnostics(page, 'mmr-open-failed');
+            throw new Error('Could not access MMR tool - direct navigation failed');
         }
 
         console.log(`✅ MMR page ready: ${mmrPage.url()}`);
