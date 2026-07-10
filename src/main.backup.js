@@ -72,137 +72,58 @@ async function humanTypeVIN(page, selector, vin) {
 async function detectCaptchaOrBlocking(page, pageName = 'page') {
     console.log(`  → Checking for CAPTCHA/blocking on ${pageName}...`);
 
-    const result = await page.evaluate(() => {
-        const bodyText = (document.body?.textContent || '');
-        const text = bodyText.toLowerCase();
+    const blockingStatus = await page.evaluate(() => {
+        const text = document.body.textContent.toLowerCase();
         const html = document.documentElement.innerHTML.toLowerCase();
 
-        // Keyword groups — each match records WHICH keyword hit and the surrounding text,
-        // so a "captcha" hit from a passive reCAPTCHA badge can be told apart from a real wall.
-        const groups = {
-            hasCaptcha: ['captcha', 'verify you are human', "verify you're human"],
-            hasCloudflare: ['cloudflare', 'checking your browser'],
-            hasAccessDenied: ['access denied', '403 forbidden', 'not authorized'],
-            hasSessionExpired: ['session expired', 'please log in', 'login required'],
-            hasRateLimit: ['too many requests', 'rate limit'],
-        };
-
-        const signals = {};
-        const matches = [];
-        for (const [signal, keywords] of Object.entries(groups)) {
-            signals[signal] = false;
-            for (const kw of keywords) {
-                const idx = text.indexOf(kw);
-                if (idx !== -1) {
-                    signals[signal] = true;
-                    const start = Math.max(0, idx - 90);
-                    const excerpt = bodyText.slice(start, idx + kw.length + 90).replace(/\s+/g, ' ').trim();
-                    matches.push({ signal, keyword: kw, excerpt });
-                }
-            }
-        }
-
-        // Distinguish an INTERACTIVE reCAPTCHA challenge from the passive footer badge/script
-        // that normal login pages carry ("This site is protected by reCAPTCHA...").
-        const recaptchaWidget = !!document.querySelector(
-            '.g-recaptcha, [data-sitekey], iframe[src*="recaptcha/api2/anchor"], iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise"]'
-        );
-        signals.hasRecaptcha = recaptchaWidget || html.includes('recaptcha');
-        const recaptchaBadgeOnly = html.includes('recaptcha') && !recaptchaWidget;
-
-        // Structural / positive signals — much more reliable than keyword guessing.
-        const hasPasswordField = !!document.querySelector('input[type="password"]');
-        const hasVinBox = !!document.querySelector('#vinText');
-
         return {
-            signals, matches, recaptchaWidget, recaptchaBadgeOnly,
-            hasPasswordField, hasVinBox,
-            title: document.title, url: location.href,
+            hasCaptcha: text.includes('captcha') ||
+                       text.includes('verify you are human') ||
+                       text.includes('verify you\'re human'),
+            hasRecaptcha: !!document.querySelector('.g-recaptcha') ||
+                         !!document.querySelector('[data-sitekey]') ||
+                         html.includes('recaptcha'),
+            hasCloudflare: text.includes('cloudflare') ||
+                          text.includes('checking your browser') ||
+                          text.includes('challenge'),
+            hasAccessDenied: text.includes('access denied') ||
+                           text.includes('403 forbidden') ||
+                           text.includes('not authorized'),
+            hasSessionExpired: text.includes('session expired') ||
+                             text.includes('please log in') ||
+                             text.includes('login required'),
+            hasRateLimit: text.includes('too many requests') ||
+                         text.includes('rate limit')
         };
     });
 
-    // Report findings with the actual matched text, so logs are self-explanatory.
-    result.matches.forEach(m => {
-        console.log(`  ⚠️ [${m.signal}] matched "${m.keyword}" → "...${m.excerpt}..."`);
-    });
-    if (result.recaptchaWidget) {
-        console.log('  ⚠️ INTERACTIVE reCAPTCHA widget present (real challenge)');
-    } else if (result.recaptchaBadgeOnly) {
-        console.log('  ℹ️ Passive reCAPTCHA badge/script only — normal on login pages, NOT a challenge');
+    // Report findings
+    if (blockingStatus.hasCaptcha) {
+        console.log('  ⚠️ CAPTCHA challenge detected!');
     }
-    if (result.hasPasswordField) {
-        console.log('  ℹ️ Password field present → this looks like a LOGIN page, not a captcha');
+    if (blockingStatus.hasRecaptcha) {
+        console.log('  ⚠️ reCAPTCHA widget found!');
     }
-    if (result.hasVinBox) {
-        console.log('  ✅ VIN search box (#vinText) present → MMR app is actually loaded');
+    if (blockingStatus.hasCloudflare) {
+        console.log('  ⚠️ Cloudflare challenge detected!');
+    }
+    if (blockingStatus.hasAccessDenied) {
+        console.log('  ⚠️ Access denied message detected!');
+    }
+    if (blockingStatus.hasSessionExpired) {
+        console.log('  ⚠️ Session expired - cookies need refresh!');
+    }
+    if (blockingStatus.hasRateLimit) {
+        console.log('  ⚠️ Rate limit detected - slow down requests!');
     }
 
-    const isBlocked = Object.values(result.signals).some(v => v) || result.recaptchaWidget;
+    const isBlocked = Object.values(blockingStatus).some(v => v);
+
     if (!isBlocked) {
         console.log(`  ✅ No blocking detected on ${pageName}`);
     }
 
-    // Flat flags kept for backwards compatibility; `.details` carries the rich data.
-    return { ...result.signals, details: result };
-}
-
-// ============================================
-// DIAGNOSTICS — capture EVERYTHING when something goes wrong
-// ============================================
-
-// Dumps a full snapshot (screenshot + HTML + visible text + metadata) to the Apify
-// key-value store so you can SEE exactly what the page was at the moment of failure.
-// View them under the run's "Storage → Key-value store" tab.
-async function saveDiagnostics(page, label) {
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const key = `DIAG-${label}-${ts}`;
-    try {
-        const url = page.url();
-        const title = await page.title().catch(() => 'unknown');
-
-        // Full-page screenshot (not just the fold)
-        const screenshot = await page.screenshot({ fullPage: true }).catch(() => null);
-        if (screenshot) {
-            await Actor.setValue(`${key}.png`, screenshot, { contentType: 'image/png' });
-        }
-
-        // Full rendered HTML of the top frame
-        const html = await page.content().catch(() => '');
-        await Actor.setValue(`${key}.html`, html, { contentType: 'text/html' });
-
-        // Visible text + structural facts
-        const facts = await page.evaluate(() => ({
-            bodyText: (document.body?.innerText || '').slice(0, 8000),
-            hasPasswordField: !!document.querySelector('input[type="password"]'),
-            hasVinBox: !!document.querySelector('#vinText'),
-            hasOdometer: !!document.querySelector('input#Odometer'),
-            recaptchaWidget: !!document.querySelector('.g-recaptcha, [data-sitekey], iframe[src*="recaptcha/api2"]'),
-            inputIds: Array.from(document.querySelectorAll('input')).map(i => i.id || i.name || i.type).slice(0, 40),
-            buttonLabels: Array.from(document.querySelectorAll('button')).map(b => b.getAttribute('aria-label') || b.textContent.trim()).filter(Boolean).slice(0, 40),
-        })).catch(() => ({}));
-
-        const frameUrls = page.frames().map(f => f.url());
-        const cookies = await page.context().cookies().catch(() => []);
-
-        const meta = {
-            label, url, title, timestamp: ts,
-            frameUrls,
-            cookiesPresent: cookies.map(c => `${c.domain} | ${c.name}`),
-            ...facts,
-        };
-        await Actor.setValue(`${key}.json`, meta);
-
-        console.log(`  🧾 Diagnostics saved → KV keys "${key}.png / .html / .json"`);
-        console.log(`     • URL:   ${url}`);
-        console.log(`     • Title: ${title}`);
-        console.log(`     • Frames(${frameUrls.length}): ${frameUrls.join(' | ')}`);
-        console.log(`     • Inputs seen: ${(meta.inputIds || []).join(', ') || 'none'}`);
-        console.log(`     • Buttons seen: ${(meta.buttonLabels || []).join(', ') || 'none'}`);
-        return meta;
-    } catch (e) {
-        console.log(`  ⚠️ Failed to save diagnostics (${label}): ${e.message}`);
-        return null;
-    }
+    return blockingStatus;
 }
 
 // ============================================
@@ -394,12 +315,12 @@ await Actor.main(async () => {
         const homeBlocking = await detectCaptchaOrBlocking(page, 'Manheim home');
         if (homeBlocking.hasCaptcha || homeBlocking.hasRecaptcha || homeBlocking.hasCloudflare) {
             console.error('\n❌ CAPTCHA or challenge detected on home page!');
-            await saveDiagnostics(page, 'home-blocked');
+            const screenshot = await page.screenshot({ fullPage: false });
+            await Actor.setValue('captcha-detected-screenshot', screenshot, { contentType: 'image/png' });
             throw new Error('CAPTCHA challenge detected - cannot proceed automatically');
         }
         if (homeBlocking.hasSessionExpired) {
             console.error('\n❌ Session expired detected!');
-            await saveDiagnostics(page, 'home-session-expired');
             throw new Error('Session cookies expired - please extract fresh cookies');
         }
 
@@ -501,61 +422,21 @@ await Actor.main(async () => {
 
         console.log(`✅ MMR page ready: ${mmrPage.url()}`);
 
-        // A healthy session 302-redirects the OAuth authorize URL straight into the MMR app.
-        // If we're still on auth.manheim.com / an /oauth/ path, give SSO a chance to complete.
-        if (mmrPage.url().includes('auth.manheim.com') || mmrPage.url().includes('/oauth/')) {
-            console.log('  ⏳ Still on auth/OAuth domain — waiting up to 20s for SSO redirect into the MMR app...');
-            await mmrPage.waitForURL(/mmr\.manheim\.com\/ui-mmr/, { timeout: 20000 })
-                .then(() => console.log(`  ✅ Redirected into MMR app: ${mmrPage.url()}`))
-                .catch(() => console.log(`  ⚠️ No SSO redirect — still at: ${mmrPage.url()}`));
-        }
-
+        // Wait for page to fully load
         console.log('  → Waiting for page to load...');
-        await mmrPage.waitForLoadState('domcontentloaded').catch(() => {});
+        await mmrPage.waitForLoadState('domcontentloaded');
         await humanDelay(2000, 4000);
 
-        // POSITIVE readiness check: the real MMR app exposes the VIN search box (#vinText).
-        // This is far more reliable than keyword-based captcha guessing, which false-positives
-        // on the "protected by reCAPTCHA" badge that ordinary login pages carry.
-        console.log('  → Verifying MMR app loaded (looking for VIN search box #vinText)...');
-        const mmrReady = await mmrPage.locator('#vinText').first()
-            .waitFor({ state: 'visible', timeout: 15000 })
-            .then(() => true)
-            .catch(() => false);
+        console.log('✅ MMR tool loaded successfully');
 
-        // Run detailed detection AND always capture a full diagnostic bundle at this checkpoint.
+        // Check for CAPTCHA on MMR page
         const mmrBlocking = await detectCaptchaOrBlocking(mmrPage, 'MMR tool');
-        await saveDiagnostics(mmrPage, mmrReady ? 'mmr-ready' : 'mmr-NOT-ready');
-
-        if (!mmrReady) {
-            const d = mmrBlocking.details || {};
-            const url = mmrPage.url();
-            let classification;
-            if (d.recaptchaWidget) {
-                classification = 'A real INTERACTIVE reCAPTCHA challenge is present on the page.';
-            } else if (d.hasPasswordField || url.includes('auth.manheim.com')) {
-                classification = 'Landed on a LOGIN page — the SSO session cookie was NOT honored. '
-                    + 'This is almost certainly NOT a captcha: the injected cookies are insufficient/expired '
-                    + 'for the auth.manheim.com OAuth flow, or Manheim changed the auth flow.';
-            } else {
-                classification = 'Unknown page — the MMR app did not load and no login/captcha signature matched. '
-                    + 'Manheim may have changed the page layout or the #vinText selector.';
-            }
-
-            console.error('\n❌ MMR app did NOT load. Diagnosis:');
-            console.error(`   • Final URL:                 ${url}`);
-            console.error(`   • Page title:                ${d.title || 'unknown'}`);
-            console.error(`   • Password field present:    ${!!d.hasPasswordField}`);
-            console.error(`   • Interactive reCAPTCHA:     ${!!d.recaptchaWidget}`);
-            console.error(`   • Passive reCAPTCHA badge:   ${!!d.recaptchaBadgeOnly}`);
-            console.error(`   • #vinText (MMR box) present: ${!!d.hasVinBox}`);
-            console.error(`   → ${classification}`);
-            console.error('   📸 Full screenshot + HTML + page text saved to the key-value store (keys starting "DIAG-mmr-NOT-ready-...").');
-
-            throw new Error(`MMR app failed to load — ${classification}`);
+        if (mmrBlocking.hasCaptcha || mmrBlocking.hasRecaptcha || mmrBlocking.hasCloudflare) {
+            console.error('\n❌ CAPTCHA or challenge detected on MMR page!');
+            const screenshot = await mmrPage.screenshot({ fullPage: false });
+            await Actor.setValue('mmr-captcha-screenshot', screenshot, { contentType: 'image/png' });
+            throw new Error('CAPTCHA on MMR tool - cannot proceed automatically');
         }
-
-        console.log('✅ MMR app is ready (VIN search box present)');
 
         // STEP 3: Process VINs from Supabase
         let vinsProcessed = 0;
@@ -1009,8 +890,6 @@ await Actor.main(async () => {
 
             } catch (vinError) {
                 console.error(`❌ Error processing VIN:`, vinError.message);
-                // Capture exactly what the page looked like at the moment of failure.
-                await saveDiagnostics(mmrPage, `vin-error-${vin || 'unknown'}`);
                 vinsFailed++;
                 vinsProcessed++;
 
