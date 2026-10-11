@@ -371,6 +371,35 @@ await Actor.main(async () => {
     await context.addCookies(manheimCookies);
     console.log('  ✅ Cookies injected successfully');
 
+    // How STALE is this cookie set? The `session` cookie embeds a JWT whose `iat` tells us
+    // exactly when the cookies were captured. The .manheim.com SESSION cookie has a server-side
+    // IDLE timeout (~1h), so a long gap between capture and run is the usual cause of failure.
+    // (The JWT's own `exp` does NOT gate access — verified; only the SESSION cookie does.)
+    try {
+        const sessionCookie = manheimCookies.find(c => c.name === 'session' && c.domain.includes('mcom-header-footer'));
+        if (sessionCookie) {
+            const outer = JSON.parse(Buffer.from(decodeURIComponent(sessionCookie.value), 'base64').toString('utf8'));
+            const jwt = (outer.associatedTokens || []).find(t => typeof t === 'string' && t.split('.').length === 3);
+            if (jwt) {
+                const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'));
+                if (payload.iat) {
+                    const capturedAt = new Date(payload.iat * 1000);
+                    const ageMin = Math.round((Date.now() - capturedAt.getTime()) / 60000);
+                    console.log(`  🕒 Cookies captured: ${capturedAt.toISOString()} (${ageMin} min ago)`);
+                    if (ageMin >= 55) {
+                        console.log(`  ⚠️ WARNING: these cookies are ${ageMin} minutes old. The Manheim SESSION`);
+                        console.log('     idles out after roughly an hour — this run will very likely hit the Sign In page.');
+                        console.log('     → Recapture cookies and run again immediately.');
+                    } else if (ageMin >= 40) {
+                        console.log(`  ⚠️ Heads up: cookies are ${ageMin} min old — getting close to the idle timeout.`);
+                    }
+                }
+            }
+        }
+    } catch {
+        // Cookie format changed or not decodable — non-fatal, just skip the freshness report.
+    }
+
     const page = await context.newPage();
 
     try {
@@ -422,6 +451,18 @@ await Actor.main(async () => {
         // is kept below (disabled) for reference only.
         console.log('  → Opening MMR tool via DIRECT navigation (popup OAuth flow no longer authenticates)...');
         mmrPage = await context.newPage();
+
+        // mmr.manheim.com/oauth/init is the endpoint that validates our .manheim.com SESSION
+        // cookie. 200 = session alive; 401 = session dead (idled out) → we get bounced to Sign In.
+        // Watching it turns a vague "login page" symptom into a precise, actionable cause.
+        let oauthInitStatus = null;
+        mmrPage.on('response', (r) => {
+            if (r.url().includes('/oauth/init')) {
+                oauthInitStatus = r.status();
+                console.log(`  🔑 Session check: mmr.manheim.com/oauth/init → HTTP ${r.status()}${r.status() === 401 ? ' (session NOT valid)' : ' (session valid)'}`);
+            }
+        });
+
         await mmrPage.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man', {
             waitUntil: 'domcontentloaded',
             timeout: 60000
@@ -489,12 +530,18 @@ await Actor.main(async () => {
             const d = mmrBlocking.details || {};
             const url = mmrPage.url();
             let classification;
-            if (d.recaptchaWidget) {
+            if (oauthInitStatus === 401) {
+                classification = 'SESSION EXPIRED. mmr.manheim.com/oauth/init returned 401, meaning the '
+                    + '.manheim.com SESSION cookie is no longer a live session, so Manheim bounced us to Sign In. '
+                    + 'This is NOT a captcha and NOT a code problem — the cookies simply went stale before this run. '
+                    + 'FIX: recapture cookies from a logged-in browser and start the run right away (the session '
+                    + 'idles out after roughly an hour of no activity).';
+            } else if (d.recaptchaWidget) {
                 classification = 'A real INTERACTIVE reCAPTCHA challenge is present on the page.';
             } else if (d.hasPasswordField || url.includes('auth.manheim.com')) {
-                classification = 'Landed on a LOGIN page — the SSO session cookie was NOT honored. '
-                    + 'This is almost certainly NOT a captcha: the injected cookies are insufficient/expired '
-                    + 'for the auth.manheim.com OAuth flow, or Manheim changed the auth flow.';
+                classification = 'Landed on a LOGIN page — the session was not honored. '
+                    + 'This is almost certainly NOT a captcha: the cookies are stale/insufficient, '
+                    + 'or Manheim changed the auth flow.';
             } else {
                 classification = 'Unknown page — the MMR app did not load and no login/captcha signature matched. '
                     + 'Manheim may have changed the page layout or the #vinText selector.';
