@@ -73,8 +73,11 @@ async function detectCaptchaOrBlocking(page, pageName = 'page') {
     console.log(`  → Checking for CAPTCHA/blocking on ${pageName}...`);
 
     const result = await page.evaluate(() => {
-        const bodyText = (document.body?.textContent || '');
-        const text = bodyText.toLowerCase();
+        // innerText = VISIBLE text only. textContent also includes inline <script> bodies, so
+        // site JS like Gravity Forms' `gforms_recaptcha_recaptcha_strings` matched "captcha".
+        const bodyText = (document.body?.innerText || '');
+        // Strip the passive "protected by reCAPTCHA" notice so it can't trip the keyword check.
+        const text = bodyText.toLowerCase().replace(/protected by recaptcha/g, '');
         const html = document.documentElement.innerHTML.toLowerCase();
 
         // Keyword groups — each match records WHICH keyword hit and the surrounding text,
@@ -103,11 +106,19 @@ async function detectCaptchaOrBlocking(page, pageName = 'page') {
         }
 
         // Distinguish an INTERACTIVE reCAPTCHA challenge from the passive footer badge/script
-        // that normal login pages carry ("This site is protected by reCAPTCHA...").
-        const recaptchaWidget = !!document.querySelector(
-            '.g-recaptcha, [data-sitekey], iframe[src*="recaptcha/api2/anchor"], iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise"]'
-        );
-        signals.hasRecaptcha = recaptchaWidget || html.includes('recaptcha');
+        // that normal pages carry. Invisible/v3 reCAPTCHA (size=invisible anchor + a hidden,
+        // off-screen bframe) is present on ordinary pages (e.g. the www.manheim.com contact form)
+        // and is NOT a challenge — only a VISIBLE checkbox or an opened image challenge counts.
+        const isShown = (el) => {
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width > 10 && r.height > 10 && r.bottom > 0 && r.right > 0
+                && s.visibility !== 'hidden' && s.display !== 'none' && parseFloat(s.opacity || '1') > 0.1;
+        };
+        const recaptchaWidget = Array.from(document.querySelectorAll(
+            'iframe[src*="recaptcha/api2/anchor"], iframe[src*="recaptcha/enterprise/anchor"], iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise/bframe"]'
+        )).some(f => !/[?&]size=invisible/.test(f.src) && isShown(f));
+        signals.hasRecaptcha = recaptchaWidget;
         const recaptchaBadgeOnly = html.includes('recaptcha') && !recaptchaWidget;
 
         // Structural / positive signals — much more reliable than keyword guessing.
@@ -128,7 +139,7 @@ async function detectCaptchaOrBlocking(page, pageName = 'page') {
     if (result.recaptchaWidget) {
         console.log('  ⚠️ INTERACTIVE reCAPTCHA widget present (real challenge)');
     } else if (result.recaptchaBadgeOnly) {
-        console.log('  ℹ️ Passive reCAPTCHA badge/script only — normal on login pages, NOT a challenge');
+        console.log('  ℹ️ Passive/invisible reCAPTCHA only — normal on many pages, NOT a challenge');
     }
     if (result.hasPasswordField) {
         console.log('  ℹ️ Password field present → this looks like a LOGIN page, not a captcha');
@@ -371,35 +382,6 @@ await Actor.main(async () => {
     await context.addCookies(manheimCookies);
     console.log('  ✅ Cookies injected successfully');
 
-    // How STALE is this cookie set? The `session` cookie embeds a JWT whose `iat` tells us
-    // exactly when the cookies were captured. The .manheim.com SESSION cookie has a server-side
-    // IDLE timeout (~1h), so a long gap between capture and run is the usual cause of failure.
-    // (The JWT's own `exp` does NOT gate access — verified; only the SESSION cookie does.)
-    try {
-        const sessionCookie = manheimCookies.find(c => c.name === 'session' && c.domain.includes('mcom-header-footer'));
-        if (sessionCookie) {
-            const outer = JSON.parse(Buffer.from(decodeURIComponent(sessionCookie.value), 'base64').toString('utf8'));
-            const jwt = (outer.associatedTokens || []).find(t => typeof t === 'string' && t.split('.').length === 3);
-            if (jwt) {
-                const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'));
-                if (payload.iat) {
-                    const capturedAt = new Date(payload.iat * 1000);
-                    const ageMin = Math.round((Date.now() - capturedAt.getTime()) / 60000);
-                    console.log(`  🕒 Cookies captured: ${capturedAt.toISOString()} (${ageMin} min ago)`);
-                    if (ageMin >= 55) {
-                        console.log(`  ⚠️ WARNING: these cookies are ${ageMin} minutes old. The Manheim SESSION`);
-                        console.log('     idles out after roughly an hour — this run will very likely hit the Sign In page.');
-                        console.log('     → Recapture cookies and run again immediately.');
-                    } else if (ageMin >= 40) {
-                        console.log(`  ⚠️ Heads up: cookies are ${ageMin} min old — getting close to the idle timeout.`);
-                    }
-                }
-            }
-        }
-    } catch {
-        // Cookie format changed or not decodable — non-fatal, just skip the freshness report.
-    }
-
     const page = await context.newPage();
 
     try {
@@ -451,18 +433,6 @@ await Actor.main(async () => {
         // is kept below (disabled) for reference only.
         console.log('  → Opening MMR tool via DIRECT navigation (popup OAuth flow no longer authenticates)...');
         mmrPage = await context.newPage();
-
-        // mmr.manheim.com/oauth/init is the endpoint that validates our .manheim.com SESSION
-        // cookie. 200 = session alive; 401 = session dead (idled out) → we get bounced to Sign In.
-        // Watching it turns a vague "login page" symptom into a precise, actionable cause.
-        let oauthInitStatus = null;
-        mmrPage.on('response', (r) => {
-            if (r.url().includes('/oauth/init')) {
-                oauthInitStatus = r.status();
-                console.log(`  🔑 Session check: mmr.manheim.com/oauth/init → HTTP ${r.status()}${r.status() === 401 ? ' (session NOT valid)' : ' (session valid)'}`);
-            }
-        });
-
         await mmrPage.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man', {
             waitUntil: 'domcontentloaded',
             timeout: 60000
@@ -530,18 +500,12 @@ await Actor.main(async () => {
             const d = mmrBlocking.details || {};
             const url = mmrPage.url();
             let classification;
-            if (oauthInitStatus === 401) {
-                classification = 'SESSION EXPIRED. mmr.manheim.com/oauth/init returned 401, meaning the '
-                    + '.manheim.com SESSION cookie is no longer a live session, so Manheim bounced us to Sign In. '
-                    + 'This is NOT a captcha and NOT a code problem — the cookies simply went stale before this run. '
-                    + 'FIX: recapture cookies from a logged-in browser and start the run right away (the session '
-                    + 'idles out after roughly an hour of no activity).';
-            } else if (d.recaptchaWidget) {
+            if (d.recaptchaWidget) {
                 classification = 'A real INTERACTIVE reCAPTCHA challenge is present on the page.';
             } else if (d.hasPasswordField || url.includes('auth.manheim.com')) {
-                classification = 'Landed on a LOGIN page — the session was not honored. '
-                    + 'This is almost certainly NOT a captcha: the cookies are stale/insufficient, '
-                    + 'or Manheim changed the auth flow.';
+                classification = 'Landed on a LOGIN page — the SSO session cookie was NOT honored. '
+                    + 'This is almost certainly NOT a captcha: the injected cookies are insufficient/expired '
+                    + 'for the auth.manheim.com OAuth flow, or Manheim changed the auth flow.';
             } else {
                 classification = 'Unknown page — the MMR app did not load and no login/captcha signature matched. '
                     + 'Manheim may have changed the page layout or the #vinText selector.';
